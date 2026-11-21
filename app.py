@@ -11,9 +11,10 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "artifacts"
 MODEL_PATH = MODEL_DIR / "model.onnx"
 CLASSES_PATH = MODEL_DIR / "classes.json"
-IMAGE_SIZE = (224, 224)
-MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+CIFAR10_CLASSES = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck",
+]
 MAX_PIXELS = 12_000_000
 
 if not MODEL_PATH.is_file() or not CLASSES_PATH.is_file():
@@ -23,7 +24,22 @@ if not MODEL_PATH.is_file() or not CLASSES_PATH.is_file():
     )
 
 with CLASSES_PATH.open(encoding="utf-8") as f:
-    CLASS_NAMES = json.load(f)
+    metadata = json.load(f)
+
+# Train.ipynb exports the exact label order and preprocessing configuration.
+# Reject stale artifacts (e.g., an older cats/dogs model) rather than silently
+# returning mislabeled predictions.
+if not isinstance(metadata, dict) or metadata.get("dataset") != "CIFAR-10":
+    raise ValueError("Wrong classes.json format. Rerun the updated CIFAR-10 train.ipynb.")
+CLASS_NAMES = metadata.get("classes")
+if CLASS_NAMES != CIFAR10_CLASSES:
+    raise ValueError("Expected the 10 CIFAR-10 classes in classes.json. Retrain and re-export.")
+if metadata.get("resize_interpolation") != "bilinear":
+    raise ValueError("Only bilinear image resizing is supported.")
+MEAN = np.asarray(metadata.get("mean"), dtype=np.float32)
+STD = np.asarray(metadata.get("std"), dtype=np.float32)
+if MEAN.shape != (3,) or STD.shape != (3,) or not np.all(STD > 0):
+    raise ValueError("Invalid RGB normalization values in classes.json.")
 
 options = ort.SessionOptions()
 options.intra_op_num_threads = 1
@@ -32,7 +48,17 @@ options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 SESSION = ort.InferenceSession(
     str(MODEL_PATH), sess_options=options, providers=["CPUExecutionProvider"]
 )
-INPUT_NAME = SESSION.get_inputs()[0].name
+model_input = SESSION.get_inputs()[0]
+INPUT_NAME = model_input.name
+input_dims = model_input.shape
+if (len(input_dims) != 4 or input_dims[1] != 3
+        or not isinstance(input_dims[2], int)
+        or not isinstance(input_dims[3], int)):
+    raise ValueError("Expected fixed NCHW ONNX model input, e.g. [1, 3, 128, 128].")
+# PIL expects (width, height); automatically use the exported model's size.
+IMAGE_SIZE = (input_dims[3], input_dims[2])
+if metadata.get("input_size") != [input_dims[2], input_dims[3]]:
+    raise ValueError("ONNX input size and classes.json do not match. Copy both from one training run.")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB uploads
@@ -59,8 +85,8 @@ PAGE = """
   </style>
 </head>
 <body><main>
-  <h1>Image Classifier</h1>
-  <p class="muted">Upload a JPG, PNG, or WEBP image (max 5 MB).</p>
+  <h1>CIFAR-10 Image Classifier</h1>
+  <p class="muted">Classify images into the 10 CIFAR-10 categories: {{ classes|join(', ') }}. Upload a JPG, PNG, or WEBP image (max 5 MB).</p>
   <form method="post" enctype="multipart/form-data">
     <input type="file" name="image" accept="image/jpeg,image/png,image/webp" required>
     <div><button type="submit">Classify image</button></div>
@@ -113,16 +139,16 @@ def predict(file_storage):
 
 @app.get("/")
 def index():
-    return render_template_string(PAGE, predictions=None, error=None)
+    return render_template_string(PAGE, classes=CLASS_NAMES, predictions=None, error=None)
 
 
 @app.post("/")
 def predict_html():
     try:
         predictions = predict(request.files.get("image"))
-        return render_template_string(PAGE, predictions=predictions, error=None)
+        return render_template_string(PAGE, classes=CLASS_NAMES, predictions=predictions, error=None)
     except ValueError as exc:
-        return render_template_string(PAGE, predictions=None, error=str(exc)), 400
+        return render_template_string(PAGE, classes=CLASS_NAMES, predictions=None, error=str(exc)), 400
 
 
 @app.post("/api/predict")
@@ -136,14 +162,15 @@ def predict_api():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "class_count": len(CLASS_NAMES)})
+    return jsonify({"status": "ok", "dataset": "CIFAR-10",
+                    "class_count": len(CLASS_NAMES), "image_size": list(IMAGE_SIZE)})
 
 
 @app.errorhandler(413)
 def too_large(_):
     if request.path.startswith("/api/"):
         return jsonify({"error": "File too large (maximum 5 MB)."}), 413
-    return render_template_string(PAGE, predictions=None, error="File too large (max 5 MB)."), 413
+    return render_template_string(PAGE, classes=CLASS_NAMES, predictions=None, error="File too large (max 5 MB)."), 413
 
 
 if __name__ == "__main__":
